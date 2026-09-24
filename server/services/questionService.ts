@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import { executeQuery, inMemoryStore, getPool } from '../db/pool';
+import { executeQuery, inMemoryStore, isPostgresReady } from '../db/pool';
 import { QUESTIONS_200, QuestionItem } from '../../src/data/questions200';
 
 export interface QuestionRecord extends QuestionItem {
@@ -9,50 +9,61 @@ export interface QuestionRecord extends QuestionItem {
 
 export class QuestionService {
   public static async initSeedIfEmpty(): Promise<void> {
-    const p = getPool();
-    if (p) {
-      const { rows } = await executeQuery('SELECT COUNT(*) as count FROM questions');
-      const count = parseInt(rows[0]?.count || '0', 10);
-      if (count === 0) {
-        console.log('[QuestionService] PostgreSQL questions table empty, seeding 200 technical questions...');
-        await this.seedQuestions(QUESTIONS_200);
-      }
-    } else {
-      if (inMemoryStore.questions.length === 0) {
-        console.log('[QuestionService] In-memory store empty, seeding 200 questions...');
-        inMemoryStore.questions = QUESTIONS_200.map((q, idx) => ({
-          ...q,
-          id: `q-${idx + 1}`,
-          created_at: new Date().toISOString(),
-        }));
+    // 1. Always seed in-memory questions so fallback is instantly available
+    if (inMemoryStore.questions.length === 0) {
+      console.log('[QuestionService] Seeding 200 technical questions into memory store...');
+      inMemoryStore.questions = QUESTIONS_200.map((q, idx) => ({
+        ...q,
+        id: `q-${idx + 1}`,
+        created_at: new Date().toISOString(),
+      }));
+    }
+
+    // 2. If PostgreSQL is connected and ready, seed PG table too
+    if (isPostgresReady()) {
+      try {
+        const { rows } = await executeQuery('SELECT COUNT(*) as count FROM questions');
+        const count = parseInt(rows[0]?.count || '0', 10);
+        if (count === 0) {
+          console.log('[QuestionService] PostgreSQL questions table empty, seeding 200 technical questions...');
+          await this.seedQuestions(QUESTIONS_200);
+        }
+      } catch (err) {
+        console.warn('[QuestionService] Warning seeding PG questions, in-memory store is active:', err);
       }
     }
   }
 
   public static async getQuestions(topic?: string, difficulty?: string, search?: string): Promise<QuestionRecord[]> {
-    const p = getPool();
-    if (p) {
-      let sql = 'SELECT * FROM questions WHERE 1=1';
-      const params: any[] = [];
-      let idx = 1;
+    const usePg = isPostgresReady();
+    if (usePg) {
+      try {
+        let sql = 'SELECT * FROM questions WHERE 1=1';
+        const params: any[] = [];
+        let idx = 1;
 
-      if (topic && topic !== 'All') {
-        sql += ` AND topic = $${idx++}`;
-        params.push(topic);
-      }
-      if (difficulty && difficulty !== 'All') {
-        sql += ` AND difficulty = $${idx++}`;
-        params.push(difficulty);
-      }
-      if (search && search.trim()) {
-        sql += ` AND (question_text ILIKE $${idx} OR explanation ILIKE $${idx})`;
-        params.push(`%${search.trim()}%`);
-        idx++;
-      }
+        if (topic && topic !== 'All') {
+          sql += ` AND topic = $${idx++}`;
+          params.push(topic);
+        }
+        if (difficulty && difficulty !== 'All') {
+          sql += ` AND difficulty = $${idx++}`;
+          params.push(difficulty);
+        }
+        if (search && search.trim()) {
+          sql += ` AND (question_text ILIKE $${idx} OR explanation ILIKE $${idx})`;
+          params.push(`%${search.trim()}%`);
+          idx++;
+        }
 
-      sql += ' ORDER BY created_at ASC';
-      const { rows } = await executeQuery(sql, params);
-      return rows;
+        sql += ' ORDER BY created_at ASC';
+        const { rows } = await executeQuery(sql, params);
+        if (rows && rows.length > 0) {
+          return rows;
+        }
+      } catch (err) {
+        console.warn('[QuestionService] Query from PG failed, falling back to in-memory:', err);
+      }
     }
 
     let list = [...inMemoryStore.questions];
@@ -75,53 +86,22 @@ export class QuestionService {
     const id = crypto.randomUUID ? crypto.randomUUID() : `q-${Date.now()}`;
     const now = new Date().toISOString();
 
-    const p = getPool();
-    if (p) {
-      const { rows } = await executeQuery(
-        `INSERT INTO questions (
-          id, question_text, option_a, option_b, option_c, option_d,
-          correct_option, topic, difficulty, time_limit, explanation, created_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-        RETURNING *`,
-        [
-          id,
-          q.question_text.trim(),
-          q.option_a.trim(),
-          q.option_b.trim(),
-          q.option_c.trim(),
-          q.option_d.trim(),
-          q.correct_option.trim().toUpperCase(),
-          q.topic,
-          q.difficulty,
-          q.time_limit || 30,
-          q.explanation || '',
-          now,
-        ]
-      );
-      return rows[0];
-    }
-
     const rec: QuestionRecord = {
       ...q,
       id,
       created_at: now,
     };
     inMemoryStore.questions.push(rec);
-    return rec;
-  }
 
-  public static async seedQuestions(questions: QuestionItem[] = QUESTIONS_200): Promise<number> {
-    const p = getPool();
-    let count = 0;
-
-    if (p) {
-      for (const q of questions) {
-        const id = crypto.randomUUID ? crypto.randomUUID() : `q-${Date.now()}-${Math.random()}`;
-        await executeQuery(
+    const usePg = isPostgresReady();
+    if (usePg) {
+      try {
+        const { rows } = await executeQuery(
           `INSERT INTO questions (
             id, question_text, option_a, option_b, option_c, option_d,
-            correct_option, topic, difficulty, time_limit, explanation
-          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+            correct_option, topic, difficulty, time_limit, explanation, created_at
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+          RETURNING *`,
           [
             id,
             q.question_text.trim(),
@@ -134,12 +114,20 @@ export class QuestionService {
             q.difficulty,
             q.time_limit || 30,
             q.explanation || '',
+            now,
           ]
         );
-        count++;
+        if (rows[0]) return rows[0];
+      } catch (e) {
+        console.warn('[QuestionService] PG addQuestion failed, using in-memory question:', e);
       }
-      return count;
     }
+
+    return rec;
+  }
+
+  public static async seedQuestions(questions: QuestionItem[] = QUESTIONS_200): Promise<number> {
+    let count = 0;
 
     for (const q of questions) {
       inMemoryStore.questions.push({
@@ -149,6 +137,38 @@ export class QuestionService {
       });
       count++;
     }
+
+    const usePg = isPostgresReady();
+    if (usePg) {
+      try {
+        for (const q of questions) {
+          const id = crypto.randomUUID ? crypto.randomUUID() : `q-${Date.now()}-${Math.random()}`;
+          await executeQuery(
+            `INSERT INTO questions (
+              id, question_text, option_a, option_b, option_c, option_d,
+              correct_option, topic, difficulty, time_limit, explanation
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            ON CONFLICT DO NOTHING`,
+            [
+              id,
+              q.question_text.trim(),
+              q.option_a.trim(),
+              q.option_b.trim(),
+              q.option_c.trim(),
+              q.option_d.trim(),
+              q.correct_option.trim().toUpperCase(),
+              q.topic,
+              q.difficulty,
+              q.time_limit || 30,
+              q.explanation || '',
+            ]
+          );
+        }
+      } catch (e) {
+        console.warn('[QuestionService] PG seedQuestions failed, in-memory is ready:', e);
+      }
+    }
+
     return count;
   }
 

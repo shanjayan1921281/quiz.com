@@ -1,6 +1,6 @@
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
-import { executeQuery, inMemoryStore, getPool } from '../db/pool';
+import { executeQuery, inMemoryStore, isPostgresReady } from '../db/pool';
 import { config } from '../config';
 
 export interface AdminPayload {
@@ -11,7 +11,7 @@ export interface AdminPayload {
 
 export class AuthService {
   public static async initDefaultAdmin(): Promise<void> {
-    const p = getPool();
+    const usePg = isPostgresReady();
     const accountsToSeed = [
       { email: config.adminEmail, pass: config.adminPassword },
       { email: 'admin@college.edu', pass: 'AdminCollege2026!' },
@@ -23,26 +23,31 @@ export class AuthService {
       const cleanEmail = acc.email.trim().toLowerCase();
       const passwordHash = await bcrypt.hash(acc.pass, 10);
 
-      if (p) {
-        const { rows } = await executeQuery('SELECT * FROM admins WHERE LOWER(email) = $1', [cleanEmail]);
-        if (rows.length === 0) {
-          await executeQuery(
-            'INSERT INTO admins (email, password_hash) VALUES ($1, $2)',
-            [acc.email, passwordHash]
-          );
-          console.log(`[AuthService] Seeded admin: ${acc.email}`);
+      if (usePg) {
+        try {
+          const { rows } = await executeQuery('SELECT * FROM admins WHERE LOWER(email) = $1', [cleanEmail]);
+          if (rows.length === 0) {
+            await executeQuery(
+              'INSERT INTO admins (email, password_hash) VALUES ($1, $2)',
+              [acc.email, passwordHash]
+            );
+            console.log(`[AuthService] Seeded admin: ${acc.email}`);
+          }
+        } catch (e) {
+          console.warn('[AuthService] Seeding PG admin failed, populating in-memory fallback:', e);
         }
-      } else {
-        const existing = inMemoryStore.admins.find((a) => a.email.toLowerCase() === cleanEmail);
-        if (!existing) {
-          inMemoryStore.admins.push({
-            id: `admin-${cleanEmail}`,
-            email: acc.email,
-            password_hash: passwordHash,
-            created_at: new Date().toISOString(),
-          });
-          console.log(`[AuthService] Seeded in-memory admin: ${acc.email}`);
-        }
+      }
+
+      // Always populate in-memory store as fallback
+      const existing = inMemoryStore.admins.find((a) => a.email.toLowerCase() === cleanEmail);
+      if (!existing) {
+        inMemoryStore.admins.push({
+          id: `admin-${cleanEmail}`,
+          email: acc.email,
+          password_hash: passwordHash,
+          created_at: new Date().toISOString(),
+        });
+        console.log(`[AuthService] Seeded in-memory admin: ${acc.email}`);
       }
     }
   }
@@ -50,13 +55,19 @@ export class AuthService {
   public static async login(email: string, pass: string): Promise<{ token: string; admin: { id: string; email: string } }> {
     const cleanEmail = email.trim().toLowerCase();
     const cleanPass = pass.trim();
-    const p = getPool();
+    const usePg = isPostgresReady();
     let adminRecord: any = null;
 
-    if (p) {
-      const { rows } = await executeQuery('SELECT * FROM admins WHERE LOWER(email) = $1 LIMIT 1', [cleanEmail]);
-      adminRecord = rows[0] || null;
-    } else {
+    if (usePg) {
+      try {
+        const { rows } = await executeQuery('SELECT * FROM admins WHERE LOWER(email) = $1 LIMIT 1', [cleanEmail]);
+        adminRecord = rows[0] || null;
+      } catch (e) {
+        console.warn('[AuthService] Query admin failed from PG, falling back to in-memory:', e);
+      }
+    }
+
+    if (!adminRecord) {
       adminRecord = inMemoryStore.admins.find((a) => a.email.toLowerCase() === cleanEmail) || null;
     }
 

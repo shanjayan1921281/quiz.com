@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { config } from '../config';
+import { INIT_SCHEMA_SQL } from './schemaSql';
 
 const { Pool } = pg;
 
@@ -12,6 +13,10 @@ export interface DbClient {
 
 let pool: pg.Pool | null = null;
 let isPostgresConnected = false;
+
+export function isPostgresReady(): boolean {
+  return pool !== null && isPostgresConnected;
+}
 
 // In-Memory store fallback (for immediate zero-friction local tests / dev sandbox)
 export interface InMemoryStore {
@@ -81,28 +86,31 @@ export async function checkDbHealth(): Promise<{ connected: boolean; type: 'post
 export async function runMigrations(): Promise<void> {
   const p = getPool();
   if (!p) {
-    console.log('[DB] No PostgreSQL DATABASE_URL detected. Running with In-Memory store.');
+    console.log('[DB] No PostgreSQL DATABASE_URL detected. Running with resilient In-Memory store.');
+    isPostgresConnected = false;
     return;
   }
 
   try {
-    const migrationFile = path.resolve('database/migrations/001_init.sql');
-    if (fs.existsSync(migrationFile)) {
-      const sql = fs.readFileSync(migrationFile, 'utf8');
-      await p.query(sql);
-      console.log('[DB] Successfully executed PostgreSQL migration 001_init.sql');
-    }
+    // Execute embedded schema migration directly (works on Vercel, Railway, Docker)
+    await p.query(INIT_SCHEMA_SQL);
     isPostgresConnected = true;
+    console.log('[DB] PostgreSQL migration executed successfully. Database is active.');
   } catch (err) {
-    console.error('[DB] Error running migration on PostgreSQL:', err);
+    console.warn('[DB] PostgreSQL connection or migration warning. Safely falling back to In-Memory store:', err);
+    isPostgresConnected = false;
   }
 }
 
 export async function executeQuery(text: string, params: any[] = []): Promise<{ rows: any[]; rowCount: number }> {
   const p = getPool();
   if (p && isPostgresConnected) {
-    const result = await p.query(text, params);
-    return { rows: result.rows, rowCount: result.rowCount || 0 };
+    try {
+      const result = await p.query(text, params);
+      return { rows: result.rows, rowCount: result.rowCount || 0 };
+    } catch (err) {
+      console.warn('[DB] PostgreSQL query failed, utilizing resilient fallback:', err);
+    }
   }
 
   // Fallback handler for in-memory emulation

@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import { executeQuery, inMemoryStore, getPool, withTransaction } from '../db/pool';
+import { executeQuery, inMemoryStore, isPostgresReady, withTransaction } from '../db/pool';
 import { EventService } from './eventService';
 import { calculateScore } from './scoringService';
 import { getWsServer } from '../websocket/wsServer';
@@ -55,69 +55,76 @@ export class ParticipantService {
       : crypto.randomBytes(24).toString('hex');
     const tokenHash = hashToken(sessionToken);
 
-    const p = getPool();
-    if (p) {
-      // Check existing by display_name
-      const { rows: existingRows } = await executeQuery(
-        'SELECT * FROM participants WHERE event_id = $1 AND LOWER(display_name) = LOWER($2) LIMIT 1',
-        [event.id, cleanName]
-      );
+    const usePg = isPostgresReady();
+    if (usePg) {
+      try {
+        // Check existing by display_name
+        const { rows: existingRows } = await executeQuery(
+          'SELECT * FROM participants WHERE event_id = $1 AND LOWER(display_name) = LOWER($2) LIMIT 1',
+          [event.id, cleanName]
+        );
 
-      if (existingRows.length > 0) {
-        const existing = existingRows[0] as Participant;
-        if (existing.status === 'DISQUALIFIED') {
-          throw new Error(
-            `You have been disqualified from this examination (Reason: ${
-              existing.disqualification_reason || 'Tab switch violation'
-            }). You cannot re-enter the test.`
-          );
+        if (existingRows.length > 0) {
+          const existing = existingRows[0] as Participant;
+          if (existing.status === 'DISQUALIFIED') {
+            throw new Error(
+              `You have been disqualified from this examination (Reason: ${
+                existing.disqualification_reason || 'Tab switch violation'
+              }). You cannot re-enter the test.`
+            );
+          }
+          // Verify token hash
+          if (existing.session_token_hash === tokenHash) {
+            // Reconnect
+            await executeQuery(
+              "UPDATE participants SET status = 'ACTIVE', last_seen_at = NOW() WHERE id = $1",
+              [existing.id]
+            );
+            existing.status = 'ACTIVE';
+            return { status: 'RECONNECTED', participant: existing, sessionToken, event };
+          } else {
+            throw new Error(`The display name "${cleanName}" is already taken in this quiz. Please choose another.`);
+          }
         }
-        // Verify token hash
-        if (existing.session_token_hash === tokenHash) {
-          // Reconnect
-          await executeQuery(
-            "UPDATE participants SET status = 'ACTIVE', last_seen_at = NOW() WHERE id = $1",
-            [existing.id]
-          );
-          existing.status = 'ACTIVE';
-          return { status: 'RECONNECTED', participant: existing, sessionToken, event };
-        } else {
-          throw new Error(`The display name "${cleanName}" is already taken in this quiz. Please choose another.`);
+
+        // Create new participant
+        const id = crypto.randomUUID ? crypto.randomUUID() : `part-${Date.now()}`;
+        const { rows: inserted } = await executeQuery(
+          `INSERT INTO participants (
+            id, event_id, display_name, session_token_hash, total_score, correct_count,
+            total_response_time_ms, status, joined_at, last_seen_at
+          ) VALUES ($1, $2, $3, $4, 0, 0, 0, 'ACTIVE', NOW(), NOW())
+          RETURNING *`,
+          [id, event.id, cleanName, tokenHash]
+        );
+
+        const newPart = inserted[0] as Participant;
+
+        // Broadcast new participant count
+        const countRes = await executeQuery('SELECT COUNT(*) as count FROM participants WHERE event_id = $1', [event.id]);
+        const totalCount = parseInt(countRes.rows[0]?.count || '1', 10);
+
+        const ws = getWsServer();
+        if (ws) {
+          ws.broadcastToEvent(event.id, {
+            type: 'PARTICIPANT_JOINED',
+            eventId: event.id,
+            payload: {
+              participantId: newPart.id,
+              displayName: newPart.display_name,
+              totalParticipants: totalCount,
+            },
+            timestamp: new Date().toISOString(),
+          });
         }
+
+        return { status: 'JOINED', participant: newPart, sessionToken, event };
+      } catch (err: any) {
+        if (err.message && (err.message.includes('disqualified') || err.message.includes('already taken'))) {
+          throw err;
+        }
+        console.warn('[ParticipantService] PG joinEvent failed, falling back to in-memory:', err);
       }
-
-      // Create new participant
-      const id = crypto.randomUUID ? crypto.randomUUID() : `part-${Date.now()}`;
-      const { rows: inserted } = await executeQuery(
-        `INSERT INTO participants (
-          id, event_id, display_name, session_token_hash, total_score, correct_count,
-          total_response_time_ms, status, joined_at, last_seen_at
-        ) VALUES ($1, $2, $3, $4, 0, 0, 0, 'ACTIVE', NOW(), NOW())
-        RETURNING *`,
-        [id, event.id, cleanName, tokenHash]
-      );
-
-      const newPart = inserted[0] as Participant;
-
-      // Broadcast new participant count
-      const countRes = await executeQuery('SELECT COUNT(*) as count FROM participants WHERE event_id = $1', [event.id]);
-      const totalCount = parseInt(countRes.rows[0]?.count || '1', 10);
-
-      const ws = getWsServer();
-      if (ws) {
-        ws.broadcastToEvent(event.id, {
-          type: 'PARTICIPANT_JOINED',
-          eventId: event.id,
-          payload: {
-            participantId: newPart.id,
-            displayName: newPart.display_name,
-            totalParticipants: totalCount,
-          },
-          timestamp: new Date().toISOString(),
-        });
-      }
-
-      return { status: 'JOINED', participant: newPart, sessionToken, event };
     }
 
     // In-memory fallback
@@ -191,10 +198,11 @@ export class ParticipantService {
     }
 
     const tokenHash = hashToken(sessionToken);
-    const p = getPool();
+    const usePg = isPostgresReady();
 
-    if (p) {
-      return withTransaction(async (client) => {
+    if (usePg) {
+      try {
+        return await withTransaction(async (client) => {
         // 1. Verify participant
         const partRes = await client.query(
           'SELECT * FROM participants WHERE id = $1 AND event_id = $2 AND session_token_hash = $3 FOR UPDATE',
@@ -318,6 +326,19 @@ export class ParticipantService {
           explanation: event.reveal_answer_immediately ? question.explanation : undefined,
         };
       });
+      } catch (err: any) {
+        if (
+          err.message &&
+          (err.message.includes('disqualified') ||
+            err.message.includes('already submitted') ||
+            err.message.includes('expired') ||
+            err.message.includes('Unauthorized') ||
+            err.message.includes('not the currently active'))
+        ) {
+          throw err;
+        }
+        console.warn('[ParticipantService] PG submitAnswer failed, falling back to in-memory:', err);
+      }
     }
 
     // In-memory fallback logic
@@ -409,17 +430,23 @@ export class ParticipantService {
     if (!event) return [];
     const resolvedEventId = event.id;
 
-    const p = getPool();
-    if (p) {
-      const { rows } = await executeQuery(
-        `SELECT id, event_id, display_name, total_score, correct_count,
-                total_response_time_ms, status, joined_at, last_seen_at
-         FROM participants
-         WHERE event_id = $1
-         ORDER BY total_score DESC, correct_count DESC, total_response_time_ms ASC, joined_at ASC`,
-        [resolvedEventId]
-      );
-      return rows.map((r, idx) => ({ ...r, rank: idx + 1 }));
+    const usePg = isPostgresReady();
+    if (usePg) {
+      try {
+        const { rows } = await executeQuery(
+          `SELECT id, event_id, display_name, total_score, correct_count,
+                  total_response_time_ms, status, joined_at, last_seen_at
+           FROM participants
+           WHERE event_id = $1
+           ORDER BY total_score DESC, correct_count DESC, total_response_time_ms ASC, joined_at ASC`,
+          [resolvedEventId]
+        );
+        if (rows && rows.length > 0) {
+          return rows.map((r, idx) => ({ ...r, rank: idx + 1 }));
+        }
+      } catch (e) {
+        console.warn('[ParticipantService] PG getParticipants failed, falling back:', e);
+      }
     }
 
     const list = inMemoryStore.participants
@@ -443,13 +470,17 @@ export class ParticipantService {
     const event = await EventService.getEventById(eventId);
     const resolvedEventId = event ? event.id : eventId;
 
-    const p = getPool();
-    if (p) {
-      const { rows } = await executeQuery(
-        'SELECT * FROM answers WHERE event_id = $1 AND participant_id = $2 AND question_id = $3 LIMIT 1',
-        [resolvedEventId, participantId, questionId]
-      );
-      return rows[0] || null;
+    const usePg = isPostgresReady();
+    if (usePg) {
+      try {
+        const { rows } = await executeQuery(
+          'SELECT * FROM answers WHERE event_id = $1 AND participant_id = $2 AND question_id = $3 LIMIT 1',
+          [resolvedEventId, participantId, questionId]
+        );
+        if (rows && rows.length > 0) return rows[0];
+      } catch (e) {
+        console.warn('[ParticipantService] PG getParticipantAnswer failed, falling back:', e);
+      }
     }
 
     return (
@@ -471,37 +502,40 @@ export class ParticipantService {
     const resolvedEventId = event.id;
 
     const tokenHash = sessionToken ? hashToken(sessionToken) : undefined;
-    const p = getPool();
+    const usePg = isPostgresReady();
     let displayName = '';
 
-    if (p) {
-      const partQuery = isAdmin || !tokenHash
-        ? 'SELECT * FROM participants WHERE id = $1 AND event_id = $2'
-        : 'SELECT * FROM participants WHERE id = $1 AND event_id = $2 AND session_token_hash = $3';
-      const params = isAdmin || !tokenHash ? [participantId, resolvedEventId] : [participantId, resolvedEventId, tokenHash];
+    if (usePg) {
+      try {
+        const partQuery = isAdmin || !tokenHash
+          ? 'SELECT * FROM participants WHERE id = $1 AND event_id = $2'
+          : 'SELECT * FROM participants WHERE id = $1 AND event_id = $2 AND session_token_hash = $3';
+        const params = isAdmin || !tokenHash ? [participantId, resolvedEventId] : [participantId, resolvedEventId, tokenHash];
 
-      const { rows } = await executeQuery(partQuery, params);
-      if (rows.length === 0) {
-        throw new Error('Participant not found or unauthorized');
+        const { rows } = await executeQuery(partQuery, params);
+        if (rows.length > 0) {
+          displayName = rows[0].display_name;
+
+          await executeQuery(
+            `UPDATE participants
+             SET status = 'DISQUALIFIED',
+                 disqualification_reason = $1,
+                 disqualified_at = NOW(),
+                 last_seen_at = NOW()
+             WHERE id = $2`,
+            [reason, participantId]
+          );
+
+          // Log the violation in event_logs
+          await executeQuery(
+            `INSERT INTO event_logs (event_id, action, metadata)
+             VALUES ($1, 'PARTICIPANT_DISQUALIFIED', $2)`,
+            [resolvedEventId, JSON.stringify({ participantId, displayName, reason, timestamp: new Date().toISOString() })]
+          );
+        }
+      } catch (e) {
+        console.warn('[ParticipantService] PG disqualify failed, falling back:', e);
       }
-      displayName = rows[0].display_name;
-
-      await executeQuery(
-        `UPDATE participants
-         SET status = 'DISQUALIFIED',
-             disqualification_reason = $1,
-             disqualified_at = NOW(),
-             last_seen_at = NOW()
-         WHERE id = $2`,
-        [reason, participantId]
-      );
-
-      // Log the violation in event_logs
-      await executeQuery(
-        `INSERT INTO event_logs (event_id, action, metadata)
-         VALUES ($1, 'PARTICIPANT_DISQUALIFIED', $2)`,
-        [resolvedEventId, JSON.stringify({ participantId, displayName, reason, timestamp: new Date().toISOString() })]
-      );
     } else {
       const part = inMemoryStore.participants.find((item) => {
         if (item.id !== participantId || (item.event_id !== resolvedEventId && item.event_id !== eventId)) return false;

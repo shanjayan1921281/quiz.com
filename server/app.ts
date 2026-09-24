@@ -6,6 +6,41 @@ import authRoutes from './routes/authRoutes';
 import eventRoutes from './routes/eventRoutes';
 import questionRoutes from './routes/questionRoutes';
 import { errorHandler } from './middleware/errorHandler';
+import { runMigrations } from './db/pool';
+import { AuthService } from './services/authService';
+import { QuestionService } from './services/questionService';
+import { EventService } from './services/eventService';
+
+let initialized = false;
+let initPromise: Promise<void> | null = null;
+
+export async function ensureAppInitialized(): Promise<void> {
+  if (initialized) return;
+  if (!initPromise) {
+    initPromise = (async () => {
+      try {
+        await runMigrations();
+        await AuthService.initDefaultAdmin();
+        await QuestionService.initSeedIfEmpty();
+        const defaultEvent = await EventService.getEventByPin('483921');
+        if (!defaultEvent) {
+          await EventService.createEvent(
+            'College Technical Championship 2026',
+            30,
+            200,
+            true,
+            '483921'
+          );
+        }
+      } catch (err) {
+        console.warn('[App Init] Warning:', err);
+      } finally {
+        initialized = true;
+      }
+    })();
+  }
+  return initPromise;
+}
 
 export function createApp(): express.Application {
   const app = express();
@@ -33,11 +68,24 @@ export function createApp(): express.Application {
   app.use(express.json({ limit: '10mb' }));
   app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-  // Routes
+  // Ensure state is initialized before processing any requests
+  app.use(async (req, res, next) => {
+    try {
+      await ensureAppInitialized();
+    } catch (e) {
+      console.warn('[App Init Middleware] Warning:', e);
+    }
+    next();
+  });
+
+  // Routes (support both /api/* and direct paths for Vercel/Express routing)
   app.use(healthRoutes);
   app.use('/api', authRoutes);
+  app.use(authRoutes);
   app.use('/api', eventRoutes);
+  app.use(eventRoutes);
   app.use('/api', questionRoutes);
+  app.use(questionRoutes);
 
   // Centralized Error Handler
   app.use(errorHandler);
