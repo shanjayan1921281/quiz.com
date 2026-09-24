@@ -1,0 +1,6 @@
+{
+  "name": "LiveQuiz Pro - Realtime College Competition Platform",
+  "description": "Production-ready live multiplayer technical quiz competition platform for college events with real-time synchronization, server-authoritative scoring, and host controls.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
