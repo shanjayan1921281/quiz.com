@@ -127,6 +127,18 @@ export function useEventSync(
     };
   }, [eventId, participantId, role, refreshState]);
 
+  // Synchronized polling fallback for Vercel / serverless deployments where WebSockets may be inactive
+  useEffect(() => {
+    if (!eventId) return;
+    const interval = setInterval(() => {
+      if (connectionStatus !== 'CONNECTED' || (event && event.status === 'LIVE')) {
+        refreshState();
+      }
+    }, 2500);
+
+    return () => clearInterval(interval);
+  }, [eventId, connectionStatus, event?.status, refreshState]);
+
   // Synchronized countdown timer based on server timestamps
   useEffect(() => {
     if (!event || event.status !== 'LIVE' || !event.question_deadline || !event.question_started_at) {

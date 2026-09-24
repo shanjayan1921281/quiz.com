@@ -49,6 +49,7 @@ export class AuthService {
 
   public static async login(email: string, pass: string): Promise<{ token: string; admin: { id: string; email: string } }> {
     const cleanEmail = email.trim().toLowerCase();
+    const cleanPass = pass.trim();
     const p = getPool();
     let adminRecord: any = null;
 
@@ -66,7 +67,7 @@ export class AuthService {
     ];
 
     const isDirectMatch = defaultMatches.some(
-      (m) => m.email === cleanEmail && pass === m.pass
+      (m) => m.email === cleanEmail && (cleanPass === m.pass || pass === m.pass)
     );
 
     if (!adminRecord) {
@@ -81,7 +82,7 @@ export class AuthService {
     } else {
       let isValid = false;
       if (adminRecord.password_hash) {
-        isValid = await bcrypt.compare(pass, adminRecord.password_hash);
+        isValid = (await bcrypt.compare(pass, adminRecord.password_hash)) || (await bcrypt.compare(cleanPass, adminRecord.password_hash));
       }
       if (!isValid && !isDirectMatch) {
         throw new Error('Invalid email or password');
